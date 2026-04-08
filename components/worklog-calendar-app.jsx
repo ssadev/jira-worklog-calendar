@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 
 const MONTHS = [
   "January",
@@ -544,6 +544,7 @@ function SettingsPanel({ onSave, lastSession }) {
 function Calendar({ creds, onLogout }) {
   const now = useMemo(() => new Date(), []);
   const pathname = usePathname();
+  const router = useRouter();
   const clientRef = useRef(makeClient(creds.domain, creds.email, creds.token));
   const currentMonth = useMemo(() => firstDayOfMonth(now), [now]);
   const initialCalendarState = useMemo(() => {
@@ -923,6 +924,8 @@ function Calendar({ creds, onLogout }) {
                     key={date}
                     className={`dc${isSelected ? " sel" : ""}`}
                     onClick={() => setSel(isSelected ? null : date)}
+                    onDoubleClick={() => router.push(`/daily-worklog?day=${date}`)}
+                    title="Double-click to open day view"
                     style={{
                       aspectRatio: "1",
                       background: backgroundColor,
