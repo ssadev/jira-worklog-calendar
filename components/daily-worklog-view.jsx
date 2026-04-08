@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 // ─── Theme (mirrors main app) ────────────────────────────────────────────────
@@ -45,6 +45,19 @@ const TICK_LABELS = [
   { label: "3pm", angleDeg: 180 },
   { label: "6pm", angleDeg: 270 },
 ];
+
+// ─── Responsive hook ──────────────────────────────────────────────────────────
+function useIsDesktop(breakpoint = 768) {
+  const [isDesktop, setIsDesktop] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia(`(min-width: ${breakpoint}px)`);
+    setIsDesktop(mq.matches);
+    const handler = (e) => setIsDesktop(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, [breakpoint]);
+  return isDesktop;
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function fmt(seconds, full = false) {
@@ -150,7 +163,6 @@ function secondsToAngle(seconds) {
 }
 
 // ─── Gap detection ────────────────────────────────────────────────────────────
-// Returns array of { startSec, endSec } gaps in the work window
 function findGaps(entries) {
   const WORK_START = CLOCK_START_HOUR * 3600;
   const WORK_END = (CLOCK_START_HOUR + 9) * 3600; // 9am to 6pm
@@ -169,7 +181,6 @@ function findGaps(entries) {
 
   if (intervals.length === 0) return [];
 
-  // Merge overlapping intervals
   const merged = [intervals[0]];
   for (let i = 1; i < intervals.length; i++) {
     const last = merged[merged.length - 1];
@@ -180,7 +191,6 @@ function findGaps(entries) {
     }
   }
 
-  // Find gaps within work window
   const gaps = [];
   let cursor = WORK_START;
   for (const { start, end } of merged) {
@@ -200,17 +210,68 @@ function secToTimeStr(sec) {
   return `${displayH}:${String(m).padStart(2, "0")} ${period}`;
 }
 
-// ─── Clock SVG ────────────────────────────────────────────────────────────────
-const CX = 150, CY = 150;
-const RING_R = 108;   // center of stroke
-const RING_W = 30;    // stroke width
-const LABEL_R = 136;  // label distance from center
-const TICK_IN = RING_R - RING_W / 2 - 1;
-const TICK_OUT = RING_R + RING_W / 2 + 4;
-const HOUR_DOT_R = RING_R + RING_W / 2 + 2;
+function fmtTimeRange(startedAt, timeSpentSeconds) {
+  if (!startedAt) return null;
+  const start = new Date(startedAt);
+  if (isNaN(start)) return null;
+  const end = new Date(start.getTime() + timeSpentSeconds * 1000);
+  const fmt12 = (d) => {
+    const h = d.getHours();
+    const m = d.getMinutes();
+    const period = h >= 12 ? "pm" : "am";
+    const displayH = h > 12 ? h - 12 : h === 0 ? 12 : h;
+    return `${displayH}:${String(m).padStart(2, "0")}${period}`;
+  };
+  return `${fmt12(start)} – ${fmt12(end)}`;
+}
 
-function ClockSVG({ entries, totalSeconds }) {
-  // Assign a color to each unique issue key
+// ─── Arc builder with greedy lane assignment ──────────────────────────────────
+// Each entry becomes ONE arc path. Overlapping entries get separate radial
+// lanes so they render as clean parallel strips with no sub-segment artifacts.
+function buildClockArcs(entries, colorMap) {
+  const arcs = entries
+    .map((e, entryIndex) => {
+      const startAngle = startedToAngle(e.startedAt);
+      if (startAngle === null) return null;
+      const spanAngle = secondsToAngle(e.timeSpentSeconds);
+      const endAngle = Math.min(startAngle + spanAngle, 360);
+      if (endAngle <= startAngle) return null;
+      return { startAngle, endAngle, color: colorMap[e.issueKey], entryIndex, lane: 0 };
+    })
+    .filter(Boolean);
+
+  if (arcs.length === 0) return [];
+
+  // Greedy interval coloring — assign lowest available lane per arc
+  const sorted = [...arcs].sort((a, b) => a.startAngle - b.startAngle);
+  const laneEnds = []; // laneEnds[k] = endAngle of the last arc placed in lane k
+
+  for (const arc of sorted) {
+    let lane = laneEnds.findIndex((end) => end <= arc.startAngle);
+    if (lane === -1) lane = laneEnds.length;
+    laneEnds[lane] = arc.endAngle;
+    arc.lane = lane;
+  }
+
+  const totalLanes = Math.max(1, laneEnds.length);
+  return arcs.map((a) => ({ ...a, totalLanes }));
+}
+
+// ─── Clock SVG ────────────────────────────────────────────────────────────────
+function ClockSVG({ entries, totalSeconds, size = 290, selectedIndex, onSelectEntry }) {
+  const CX = size / 2;
+  const CY = size / 2;
+  const scale = size / 300;
+  const RING_R = 108 * scale;
+  const RING_W = 30 * scale;
+  const LABEL_R = 136 * scale;
+  const TICK_IN = RING_R - RING_W / 2 - 1 * scale;
+  const TICK_OUT = RING_R + RING_W / 2 + 4 * scale;
+  const HOUR_DOT_R = RING_R + RING_W / 2 + 2 * scale;
+  const BAND_GAP = 1.5 * scale;
+
+  const [hoveredIndex, setHoveredIndex] = useState(null);
+
   const colorMap = useMemo(() => {
     const map = {};
     let idx = 0;
@@ -225,62 +286,70 @@ function ClockSVG({ entries, totalSeconds }) {
     return map;
   }, [entries]);
 
-  const arcs = useMemo(() => {
-    return entries
-      .map((e) => {
-        const startAngle = startedToAngle(e.startedAt);
-        if (startAngle === null) return null;
-        const spanAngle = secondsToAngle(e.timeSpentSeconds);
-        const endAngle = Math.min(startAngle + spanAngle, 360);
-        if (endAngle <= startAngle) return null;
-        return { startAngle, endAngle, color: colorMap[e.issueKey], key: e.issueKey };
-      })
-      .filter(Boolean);
-  }, [entries, colorMap]);
+  const arcs = useMemo(
+    () => buildClockArcs(entries, colorMap),
+    [entries, colorMap]
+  );
 
   const progressPct = Math.min(totalSeconds / TARGET_SECONDS, 1);
-  const BAR_W = 72;
-  const BAR_H = 3;
+  const BAR_W = 72 * scale;
+  const BAR_H = 3 * scale;
   const BAR_X = CX - BAR_W / 2;
-  const BAR_Y = CY + 18;
+  const BAR_Y = CY + 18 * scale;
 
-  // Minor hour dots around ring (every hour = 30°, skip the 4 major ticks)
   const majorAngles = new Set(TICK_LABELS.map((t) => t.angleDeg));
   const minorDots = Array.from({ length: 12 }, (_, i) => i * 30).filter(
     (a) => !majorAngles.has(a)
   );
 
   return (
-    <svg viewBox="0 0 300 300" width="290" height="290" style={{ overflow: "visible" }}>
-      {/* Track ring (background) */}
-      <circle
-        cx={CX}
-        cy={CY}
-        r={RING_R}
-        fill="none"
-        stroke={T.surface2}
-        strokeWidth={RING_W}
-      />
+    <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} style={{ overflow: "visible" }}>
+      <defs>
+        {/* Glow filter for selected/hovered arcs */}
+        <filter id="arc-glow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation={3 * scale} result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
 
-      {/* Worklog arcs */}
-      {arcs.map(({ startAngle, endAngle, color }, i) => (
-        <path
-          key={i}
-          d={arcPath(CX, CY, RING_R, startAngle, endAngle)}
-          fill="none"
-          stroke={color}
-          strokeWidth={RING_W}
-          strokeLinecap="butt"
-          opacity={0.88}
-        />
-      ))}
+      {/* Track ring */}
+      <circle cx={CX} cy={CY} r={RING_R} fill="none" stroke={T.surface2} strokeWidth={RING_W} />
+
+      {/* Worklog arcs — one path per entry, lanes offset radially for overlaps */}
+      {arcs.map(({ startAngle, endAngle, color, lane, totalLanes, entryIndex }) => {
+        const laneWidth = (RING_W - BAND_GAP * (totalLanes - 1)) / totalLanes;
+        // Lane 0 = outermost strip
+        const bandCenter = RING_R + RING_W / 2 - lane * (laneWidth + BAND_GAP) - laneWidth / 2;
+        const isSelected = selectedIndex === entryIndex;
+        const isHovered = hoveredIndex === entryIndex;
+        const isActive = isSelected || isHovered;
+        const hasFocus = selectedIndex !== null || hoveredIndex !== null;
+        const opacity = isActive ? 1 : hasFocus ? 0.25 : 0.88;
+        return (
+          <path
+            key={entryIndex}
+            d={arcPath(CX, CY, bandCenter, startAngle, endAngle)}
+            fill="none"
+            stroke={color}
+            strokeWidth={laneWidth}
+            strokeLinecap="round"
+            opacity={opacity}
+            filter={isActive ? "url(#arc-glow)" : undefined}
+            style={{ cursor: "pointer", transition: "opacity 0.18s" }}
+            onClick={() => onSelectEntry(entryIndex === selectedIndex ? null : entryIndex)}
+            onMouseEnter={() => setHoveredIndex(entryIndex)}
+            onMouseLeave={() => setHoveredIndex(null)}
+          />
+        );
+      })}
 
       {/* Minor hour dots */}
       {minorDots.map((angle) => {
         const p = polarXY(CX, CY, HOUR_DOT_R, angle);
-        return (
-          <circle key={angle} cx={p.x} cy={p.y} r={1.5} fill={T.textDim} opacity={0.6} />
-        );
+        return <circle key={angle} cx={p.x} cy={p.y} r={1.5 * scale} fill={T.textDim} opacity={0.6} />;
       })}
 
       {/* Major hour ticks + labels */}
@@ -290,21 +359,14 @@ function ClockSVG({ entries, totalSeconds }) {
         const lp = polarXY(CX, CY, LABEL_R, angleDeg);
         return (
           <g key={label}>
-            <line
-              x1={inner.x}
-              y1={inner.y}
-              x2={outer.x}
-              y2={outer.y}
-              stroke={T.textDim}
-              strokeWidth={1.5}
-            />
+            <line x1={inner.x} y1={inner.y} x2={outer.x} y2={outer.y} stroke={T.textDim} strokeWidth={1.5 * scale} />
             <text
               x={lp.x}
               y={lp.y}
               textAnchor="middle"
               dominantBaseline="middle"
               fill={T.textMuted}
-              fontSize={8.5}
+              fontSize={8.5 * scale}
               fontFamily="'DM Mono', monospace"
             >
               {label}
@@ -316,11 +378,11 @@ function ClockSVG({ entries, totalSeconds }) {
       {/* Center: total logged */}
       <text
         x={CX}
-        y={CY - 22}
+        y={CY - 22 * scale}
         textAnchor="middle"
         dominantBaseline="middle"
         fill={T.text}
-        fontSize={28}
+        fontSize={28 * scale}
         fontWeight={700}
         fontFamily="'Syne', sans-serif"
         letterSpacing={-0.5}
@@ -331,11 +393,11 @@ function ClockSVG({ entries, totalSeconds }) {
       {/* Center: subtitle */}
       <text
         x={CX}
-        y={CY + 2}
+        y={CY + 2 * scale}
         textAnchor="middle"
         dominantBaseline="middle"
         fill={T.textMuted}
-        fontSize={9.5}
+        fontSize={9.5 * scale}
         fontFamily="'DM Mono', monospace"
         letterSpacing={0.3}
       >
@@ -343,31 +405,17 @@ function ClockSVG({ entries, totalSeconds }) {
       </text>
 
       {/* Progress bar */}
-      <rect
-        x={BAR_X}
-        y={BAR_Y}
-        width={BAR_W}
-        height={BAR_H}
-        rx={BAR_H / 2}
-        fill={T.surface2}
-      />
-      <rect
-        x={BAR_X}
-        y={BAR_Y}
-        width={BAR_W * progressPct}
-        height={BAR_H}
-        rx={BAR_H / 2}
-        fill={T.green}
-      />
+      <rect x={BAR_X} y={BAR_Y} width={BAR_W} height={BAR_H} rx={BAR_H / 2} fill={T.surface2} />
+      <rect x={BAR_X} y={BAR_Y} width={BAR_W * progressPct} height={BAR_H} rx={BAR_H / 2} fill={T.green} />
 
       {/* Progress label */}
       <text
         x={CX}
-        y={BAR_Y + 13}
+        y={BAR_Y + 13 * scale}
         textAnchor="middle"
         dominantBaseline="middle"
         fill={T.textDim}
-        fontSize={8.5}
+        fontSize={8.5 * scale}
         fontFamily="'DM Mono', monospace"
       >
         {Math.round(progressPct * 100)}% · target {fmt(TARGET_SECONDS, true)}
@@ -377,17 +425,23 @@ function ClockSVG({ entries, totalSeconds }) {
 }
 
 // ─── Worklog list item ────────────────────────────────────────────────────────
-function WorklogItem({ entry, color }) {
+function WorklogItem({ entry, color, isSelected, itemRef }) {
+  const timeRange = fmtTimeRange(entry.startedAt, entry.timeSpentSeconds);
+
   return (
     <div
+      ref={itemRef}
       style={{
-        background: T.surface2,
-        border: `1px solid ${T.border}`,
+        background: isSelected ? `${color}14` : T.surface2,
+        border: `1px solid ${isSelected ? color + "70" : T.border}`,
         borderRadius: 8,
         padding: "11px 13px",
         borderLeft: `3px solid ${color}`,
+        transition: "background 0.2s, border-color 0.2s, box-shadow 0.2s",
+        boxShadow: isSelected ? `0 0 0 1px ${color}30, 0 4px 16px ${color}18` : "none",
       }}
     >
+      {/* Top row: issue key + time range + duration */}
       <div
         style={{
           display: "flex",
@@ -408,20 +462,40 @@ function WorklogItem({ entry, color }) {
         >
           {entry.issueKey}
         </span>
-        <span
-          style={{
-            fontSize: 12,
-            color: T.text,
-            fontWeight: 600,
-            fontFamily: "'DM Mono', monospace",
-          }}
-        >
-          {fmt(entry.timeSpentSeconds, true)}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          {timeRange && (
+            <span
+              style={{
+                fontSize: 10,
+                color: T.textMuted,
+                fontFamily: "'DM Mono', monospace",
+                letterSpacing: "0.02em",
+              }}
+            >
+              {timeRange}
+            </span>
+          )}
+          <span
+            style={{
+              fontSize: 12,
+              color: T.text,
+              fontWeight: 600,
+              fontFamily: "'DM Mono', monospace",
+              background: `${color}18`,
+              border: `1px solid ${color}40`,
+              borderRadius: 4,
+              padding: "1px 6px",
+            }}
+          >
+            {fmt(entry.timeSpentSeconds, true)}
+          </span>
+        </div>
       </div>
+
       <div style={{ fontSize: 12, color: T.textSub, lineHeight: 1.45 }}>
         {entry.issueSummary}
       </div>
+
       {entry.comment ? (
         <div
           style={{
@@ -445,34 +519,31 @@ function WorklogItem({ entry, color }) {
 export default function DailyWorklogView() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const isDesktop = useIsDesktop(768);
 
-  // Resolve the day from ?day=YYYY-MM-DD (fall back to today)
   const rawDay = searchParams.get("day");
   const today = toDS(new Date());
   const day = isValidDayStr(rawDay) ? rawDay : today;
 
   const [creds, setCreds] = useState(null);
   const [credsLoaded, setCredsLoaded] = useState(false);
-  const [monthData, setMonthData] = useState({}); // { "YYYY-MM-DD": Entry[] }
+  const [monthData, setMonthData] = useState({});
   const [fetchedMonths, setFetchedMonths] = useState(new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Read credentials from localStorage once on mount
   useEffect(() => {
     const raw = typeof window !== "undefined" ? localStorage.getItem("jira-worklog-creds") : null;
     setCreds(parseStoredCreds(raw));
     setCredsLoaded(true);
   }, []);
 
-  // Redirect to home if no credentials once we've loaded
   useEffect(() => {
     if (credsLoaded && !creds) {
       router.replace("/");
     }
   }, [credsLoaded, creds, router]);
 
-  // Fetch worklogs whenever day or creds change
   const monthKey = day.slice(0, 7);
 
   const fetchMonth = useCallback(
@@ -506,7 +577,6 @@ export default function DailyWorklogView() {
     [router]
   );
 
-  // Derive display values
   const entries = useMemo(() => monthData[day] || [], [monthData, day]);
   const dayDate = useMemo(() => new Date(`${day}T12:00:00`), [day]);
   const totalSeconds = useMemo(
@@ -529,12 +599,23 @@ export default function DailyWorklogView() {
   }, [entries]);
 
   const gaps = useMemo(() => findGaps(entries), [entries]);
-
   const isToday = day === today;
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  const [selectedIndex, setSelectedIndex] = useState(null);
+  const entryRefs = useRef({});
+
+  // Reset selection when day changes
+  useEffect(() => { setSelectedIndex(null); }, [day]);
+
+  // Scroll selected entry into view
+  useEffect(() => {
+    if (selectedIndex === null) return;
+    const el = entryRefs.current[selectedIndex];
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [selectedIndex]);
+
   if (!credsLoaded) return null;
-  if (credsLoaded && !creds) return null; // redirecting
+  if (credsLoaded && !creds) return null;
 
   const prevDay = addDays(day, -1);
   const nextDay = addDays(day, 1);
@@ -543,33 +624,137 @@ export default function DailyWorklogView() {
   const weekday = dayDate.toLocaleDateString("en-US", { weekday: "long" });
   const dateLabel = dayDate.toLocaleDateString("en-US", { month: "long", day: "numeric" });
 
+  const clockSize = isDesktop ? 380 : 290;
+
+  // ── Worklog list content (shared between layouts) ──────────────────────────
+  const worklogListContent = (
+    <>
+      {/* Section heading */}
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          color: T.textMuted,
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          marginBottom: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          paddingBottom: 10,
+          borderBottom: `1px solid ${T.border}`,
+        }}
+      >
+        Worklogs
+        <span style={{ color: T.textDim, fontWeight: 400 }}>—</span>
+        <span style={{ color: T.textSub, fontWeight: 400 }}>{dateLabel}</span>
+        {entries.length > 0 && (
+          <span
+            style={{
+              marginLeft: "auto",
+              fontSize: 10,
+              color: T.textDim,
+              fontWeight: 400,
+            }}
+          >
+            {entries.length} {entries.length === 1 ? "entry" : "entries"}
+          </span>
+        )}
+      </div>
+
+      {error ? (
+        <div
+          style={{
+            background: "rgba(248,113,113,0.08)",
+            border: `1px solid rgba(248,113,113,0.25)`,
+            borderRadius: 8,
+            padding: "12px 14px",
+            fontSize: 12,
+            color: T.red,
+          }}
+        >
+          {error}
+        </div>
+      ) : loading ? (
+        <div style={{ color: T.textDim, fontSize: 12, padding: "20px 0", textAlign: "center" }}>
+          Fetching worklogs…
+        </div>
+      ) : entries.length === 0 ? (
+        <div style={{ textAlign: "center", color: T.textDim, fontSize: 12, padding: "32px 0" }}>
+          No worklogs for this day.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {entries.map((entry, i) => (
+            <WorklogItem
+              key={`${entry.issueKey}-${i}`}
+              entry={entry}
+              color={colorMap[entry.issueKey]}
+              isSelected={selectedIndex === i}
+              itemRef={(el) => { entryRefs.current[i] = el; }}
+            />
+          ))}
+
+          {/* Unlogged gap indicators */}
+          {gaps.map((gap, i) => {
+            const durSec = gap.endSec - gap.startSec;
+            return (
+              <div
+                key={`gap-${i}`}
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${T.border}`,
+                  borderRadius: 8,
+                  padding: "9px 13px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  opacity: 0.55,
+                }}
+              >
+                <span style={{ fontSize: 11, color: T.textMuted }}>
+                  {fmt(durSec, true)} unlogged
+                </span>
+                <span style={{ fontSize: 10, color: T.textDim, fontFamily: "'DM Mono', monospace" }}>
+                  {secToTimeStr(gap.startSec)} – {secToTimeStr(gap.endSec)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+
   return (
     <div
       style={{
         minHeight: "100dvh",
         background: T.bg,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
         fontFamily: "'DM Mono', 'Courier New', monospace",
         color: T.text,
-        paddingBottom: 48,
       }}
     >
-      {/* ── Header ────────────────────────────────────────────────────────── */}
+      {/* ── Page wrapper ──────────────────────────────────────────────────── */}
       <div
         style={{
-          width: "100%",
-          maxWidth: 480,
-          padding: "18px 20px 0",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 10,
+          maxWidth: isDesktop ? 1100 : 480,
+          margin: "0 auto",
+          padding: isDesktop ? "28px 40px 60px" : "18px 20px 48px",
         }}
       >
-        {/* Back link */}
-        <div style={{ width: "100%", display: "flex", justifyContent: "flex-start" }}>
+        {/* ── Top bar: back + date navigation ──────────────────────────────── */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: isDesktop ? 40 : 20,
+            gap: 16,
+          }}
+        >
+          {/* Back link */}
           <button
             onClick={() => router.push("/")}
             style={{
@@ -583,200 +768,188 @@ export default function DailyWorklogView() {
               alignItems: "center",
               gap: 5,
               fontFamily: "inherit",
+              flexShrink: 0,
             }}
           >
             ← Calendar
           </button>
-        </div>
 
-        {/* Date navigation */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            width: "100%",
-            justifyContent: "space-between",
-          }}
-        >
-          <button
-            onClick={() => navigateDay(prevDay)}
-            style={navBtnStyle}
-            aria-label="Previous day"
-          >
-            ‹
-          </button>
-
-          <div style={{ textAlign: "center", flex: 1 }}>
-            <div
-              style={{
-                fontFamily: "'Syne', sans-serif",
-                fontWeight: 700,
-                fontSize: 16,
-                color: T.text,
-                letterSpacing: 0.2,
-              }}
-            >
-              {weekday} · {dateLabel}
-            </div>
-            {isToday && (
-              <div
-                style={{
-                  display: "inline-block",
-                  marginTop: 4,
-                  fontSize: 10,
-                  color: T.accent,
-                  background: "rgba(139,127,255,0.12)",
-                  border: `1px solid rgba(139,127,255,0.3)`,
-                  borderRadius: 20,
-                  padding: "2px 10px",
-                  fontWeight: 600,
-                  letterSpacing: "0.05em",
-                }}
-              >
-                Today
-              </div>
-            )}
-          </div>
-
-          <button
-            onClick={() => navigateDay(nextDay)}
-            disabled={isNextFuture}
-            style={{ ...navBtnStyle, opacity: isNextFuture ? 0.25 : 1 }}
-            aria-label="Next day"
-          >
-            ›
-          </button>
-        </div>
-      </div>
-
-      {/* ── Clock ─────────────────────────────────────────────────────────── */}
-      <div
-        style={{
-          marginTop: 20,
-          display: "flex",
-          justifyContent: "center",
-          position: "relative",
-        }}
-      >
-        {loading ? (
+          {/* Date navigation */}
           <div
             style={{
-              width: 290,
-              height: 290,
               display: "flex",
               alignItems: "center",
+              gap: 12,
+              flex: isDesktop ? "unset" : 1,
               justifyContent: "center",
-              color: T.textDim,
-              fontSize: 12,
             }}
           >
-            Loading…
-          </div>
-        ) : (
-          <ClockSVG entries={entries} totalSeconds={totalSeconds} />
-        )}
-      </div>
+            <button
+              onClick={() => navigateDay(prevDay)}
+              style={navBtnStyle}
+              aria-label="Previous day"
+            >
+              ‹
+            </button>
 
-      {/* ── Worklog list ───────────────────────────────────────────────────── */}
-      <div
-        style={{
-          width: "100%",
-          maxWidth: 480,
-          padding: "0 20px",
-          marginTop: 4,
-        }}
-      >
-        {/* Section heading */}
-        <div
-          style={{
-            fontSize: 11,
-            fontWeight: 700,
-            color: T.textMuted,
-            letterSpacing: "0.12em",
-            textTransform: "uppercase",
-            marginBottom: 10,
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          Worklogs
-          <span style={{ color: T.textDim, fontWeight: 400 }}>—</span>
-          <span style={{ color: T.textSub, fontWeight: 400 }}>
-            {dateLabel}
-          </span>
-        </div>
-
-        {error ? (
-          <div
-            style={{
-              background: "rgba(248,113,113,0.08)",
-              border: `1px solid rgba(248,113,113,0.25)`,
-              borderRadius: 8,
-              padding: "12px 14px",
-              fontSize: 12,
-              color: T.red,
-            }}
-          >
-            {error}
-          </div>
-        ) : loading ? (
-          <div style={{ color: T.textDim, fontSize: 12, padding: "20px 0", textAlign: "center" }}>
-            Fetching worklogs…
-          </div>
-        ) : entries.length === 0 ? (
-          <div
-            style={{
-              textAlign: "center",
-              color: T.textDim,
-              fontSize: 12,
-              padding: "32px 0",
-            }}
-          >
-            No worklogs for this day.
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {entries.map((entry, i) => (
-              <WorklogItem key={`${entry.issueKey}-${i}`} entry={entry} color={colorMap[entry.issueKey]} />
-            ))}
-
-            {/* Unlogged gap indicators */}
-            {gaps.map((gap, i) => {
-              const durSec = gap.endSec - gap.startSec;
-              return (
+            <div style={{ textAlign: "center", minWidth: isDesktop ? 220 : 0 }}>
+              <div
+                style={{
+                  fontFamily: "'Syne', sans-serif",
+                  fontWeight: 700,
+                  fontSize: isDesktop ? 20 : 16,
+                  color: T.text,
+                  letterSpacing: 0.2,
+                }}
+              >
+                {weekday} · {dateLabel}
+              </div>
+              {isToday && (
                 <div
-                  key={`gap-${i}`}
                   style={{
-                    background: "transparent",
-                    border: `1px solid ${T.border}`,
-                    borderRadius: 8,
-                    padding: "9px 13px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 8,
-                    opacity: 0.55,
+                    display: "inline-block",
+                    marginTop: 4,
+                    fontSize: 10,
+                    color: T.accent,
+                    background: "rgba(139,127,255,0.12)",
+                    border: `1px solid rgba(139,127,255,0.3)`,
+                    borderRadius: 20,
+                    padding: "2px 10px",
+                    fontWeight: 600,
+                    letterSpacing: "0.05em",
                   }}
                 >
-                  <span style={{ fontSize: 11, color: T.textMuted }}>
-                    {fmt(durSec, true)} unlogged
-                  </span>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      color: T.textDim,
-                      fontFamily: "'DM Mono', monospace",
-                    }}
-                  >
-                    {secToTimeStr(gap.startSec)} – {secToTimeStr(gap.endSec)}
-                  </span>
+                  Today
                 </div>
-              );
-            })}
+              )}
+            </div>
+
+            <button
+              onClick={() => navigateDay(nextDay)}
+              disabled={isNextFuture}
+              style={{ ...navBtnStyle, opacity: isNextFuture ? 0.25 : 1 }}
+              aria-label="Next day"
+            >
+              ›
+            </button>
           </div>
+
+          {/* Spacer on desktop so date stays centered */}
+          {isDesktop && <div style={{ width: 80, flexShrink: 0 }} />}
+        </div>
+
+        {/* ── Body: desktop = two columns, mobile = stacked ─────────────────── */}
+        {isDesktop ? (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: `${clockSize + 40}px 1fr`,
+              gap: 48,
+              alignItems: "start",
+            }}
+          >
+            {/* Left column: clock + summary */}
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+              {/* Stats strip above clock */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: 12,
+                  marginBottom: 24,
+                  width: "100%",
+                  justifyContent: "center",
+                }}
+              >
+                <StatPill label="Logged" value={fmt(totalSeconds, true)} color={T.green} />
+                <StatPill
+                  label="Remaining"
+                  value={totalSeconds >= TARGET_SECONDS ? "Done" : fmt(TARGET_SECONDS - totalSeconds, true)}
+                  color={totalSeconds >= TARGET_SECONDS ? T.green : T.accent}
+                />
+              </div>
+
+              {loading ? (
+                <div
+                  style={{
+                    width: clockSize,
+                    height: clockSize,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: T.textDim,
+                    fontSize: 12,
+                  }}
+                >
+                  Loading…
+                </div>
+              ) : (
+                <ClockSVG entries={entries} totalSeconds={totalSeconds} size={clockSize} selectedIndex={selectedIndex} onSelectEntry={setSelectedIndex} />
+              )}
+            </div>
+
+            {/* Right column: worklog list */}
+            <div
+              style={{
+                background: T.surface,
+                border: `1px solid ${T.border}`,
+                borderRadius: 12,
+                padding: "20px 20px",
+                maxHeight: "calc(100vh - 180px)",
+                overflowY: "auto",
+              }}
+            >
+              {worklogListContent}
+            </div>
+          </div>
+        ) : (
+          /* Mobile: stacked layout */
+          <>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 4 }}>
+              {loading ? (
+                <div
+                  style={{
+                    width: clockSize,
+                    height: clockSize,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: T.textDim,
+                    fontSize: 12,
+                  }}
+                >
+                  Loading…
+                </div>
+              ) : (
+                <ClockSVG entries={entries} totalSeconds={totalSeconds} size={clockSize} selectedIndex={selectedIndex} onSelectEntry={setSelectedIndex} />
+              )}
+            </div>
+
+            <div>{worklogListContent}</div>
+          </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Stat pill (desktop only) ─────────────────────────────────────────────────
+function StatPill({ label, value, color }) {
+  return (
+    <div
+      style={{
+        background: T.surface2,
+        border: `1px solid ${T.border}`,
+        borderRadius: 8,
+        padding: "8px 16px",
+        textAlign: "center",
+        flex: 1,
+      }}
+    >
+      <div style={{ fontSize: 10, color: T.textMuted, letterSpacing: "0.08em", marginBottom: 3, textTransform: "uppercase" }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 18, fontWeight: 700, color, fontFamily: "'Syne', sans-serif" }}>
+        {value}
       </div>
     </div>
   );
