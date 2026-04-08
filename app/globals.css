@@ -41,3 +41,12 @@ input::placeholder {
   background: #3a3a58;
   border-radius: 2px;
 }
+
+/* Remove focus outlines from Recharts chart elements */
+.recharts-wrapper,
+.recharts-wrapper svg,
+.recharts-wrapper svg *:focus,
+.recharts-surface,
+.recharts-surface *:focus {
+  outline: none !important;
+}

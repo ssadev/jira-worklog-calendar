@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { PieChart, Pie, Cell, Sector } from "recharts";
 
 // ─── Theme (mirrors main app) ────────────────────────────────────────────────
 const T = {
@@ -141,9 +142,17 @@ function polarXY(cx, cy, r, angleDeg) {
 }
 
 function arcPath(cx, cy, r, startDeg, endDeg) {
+  const span = endDeg - startDeg;
+  // For near-full-circle arcs, draw two half-arcs to avoid SVG arc ambiguity
+  if (span >= 359.99) {
+    const mid = startDeg + 180;
+    const s = polarXY(cx, cy, r, startDeg);
+    const m = polarXY(cx, cy, r, mid);
+    return `M ${s.x} ${s.y} A ${r} ${r} 0 1 1 ${m.x} ${m.y} A ${r} ${r} 0 1 1 ${s.x} ${s.y}`;
+  }
   const s = polarXY(cx, cy, r, startDeg);
   const e = polarXY(cx, cy, r, endDeg);
-  const large = endDeg - startDeg > 180 ? 1 : 0;
+  const large = span > 180 ? 1 : 0;
   return `M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`;
 }
 
@@ -228,14 +237,18 @@ function fmtTimeRange(startedAt, timeSpentSeconds) {
 // ─── Arc builder with greedy lane assignment ──────────────────────────────────
 // Each entry becomes ONE arc path. Overlapping entries get separate radial
 // lanes so they render as clean parallel strips with no sub-segment artifacts.
+const MIN_ARC_ANGLE = 3; // Minimum arc span in degrees so short worklogs stay visible
+
 function buildClockArcs(entries, colorMap) {
   const arcs = entries
     .map((e, entryIndex) => {
       const startAngle = startedToAngle(e.startedAt);
       if (startAngle === null) return null;
       const spanAngle = secondsToAngle(e.timeSpentSeconds);
-      const endAngle = Math.min(startAngle + spanAngle, 360);
-      if (endAngle <= startAngle) return null;
+      // Enforce minimum visible arc span
+      const effectiveSpan = Math.max(spanAngle, MIN_ARC_ANGLE);
+      const endAngle = Math.min(startAngle + effectiveSpan, 360);
+      if (endAngle - startAngle < 0.1) return null; // skip truly degenerate arcs
       return { startAngle, endAngle, color: colorMap[e.issueKey], entryIndex, lane: 0 };
     })
     .filter(Boolean);
@@ -247,7 +260,8 @@ function buildClockArcs(entries, colorMap) {
   const laneEnds = []; // laneEnds[k] = endAngle of the last arc placed in lane k
 
   for (const arc of sorted) {
-    let lane = laneEnds.findIndex((end) => end <= arc.startAngle);
+    // Use strict < so arcs that exactly touch don't get pushed to a new lane
+    let lane = laneEnds.findIndex((end) => end < arc.startAngle + 0.5);
     if (lane === -1) lane = laneEnds.length;
     laneEnds[lane] = arc.endAngle;
     arc.lane = lane;
@@ -257,18 +271,111 @@ function buildClockArcs(entries, colorMap) {
   return arcs.map((a) => ({ ...a, totalLanes }));
 }
 
-// ─── Clock SVG ────────────────────────────────────────────────────────────────
+// ─── Recharts-based Clock ─────────────────────────────────────────────────────
+// Custom sector shape with built-in click/hover handlers (Recharts v3 Pie onClick doesn't fire)
+function InteractiveSector(props) {
+  const {
+    cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill,
+    payload, cornerRadius: cr,
+  } = props;
+
+  if (!payload || payload.type === "gap") {
+    return (
+      <Sector
+        cx={cx} cy={cy}
+        innerRadius={innerRadius}
+        outerRadius={outerRadius}
+        startAngle={startAngle}
+        endAngle={endAngle}
+        fill="transparent"
+        stroke="none"
+        cornerRadius={cr}
+      />
+    );
+  }
+
+  const isActive = payload.isActive;
+  return (
+    <Sector
+      cx={cx} cy={cy}
+      innerRadius={isActive ? innerRadius - 2 : innerRadius}
+      outerRadius={isActive ? outerRadius + 2 : outerRadius}
+      startAngle={startAngle}
+      endAngle={endAngle}
+      fill={fill}
+      stroke="none"
+      cornerRadius={cr}
+      opacity={payload.opacity}
+      style={{ cursor: "pointer", transition: "opacity 0.18s" }}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (payload.onSelect) payload.onSelect();
+      }}
+      onMouseEnter={() => { if (payload.onHover) payload.onHover(); }}
+      onMouseLeave={() => { if (payload.onUnhover) payload.onUnhover(); }}
+    />
+  );
+}
+
+// Convert our clock angles (0°=9am, clockwise) to Recharts angles (90°=top, counter-clockwise)
+// Our 0° (9am) = top of clock = Recharts 90°
+// Our angle increases clockwise, Recharts increases counter-clockwise
+// So: rechartsAngle = 90 - ourAngle
+function toRechartsAngle(ourAngle) {
+  return 90 - ourAngle;
+}
+
+// Build pie data for a single lane — fill gaps with transparent entries
+function buildLanePieData(laneArcs, selectedIndex, hoveredIndex, onSelect, onHover, onUnhover) {
+  const sorted = [...laneArcs].sort((a, b) => a.startAngle - b.startAngle);
+  const data = [];
+  let cursor = 0;
+
+  for (const arc of sorted) {
+    // Gap before this arc
+    if (arc.startAngle > cursor + 0.1) {
+      data.push({ value: arc.startAngle - cursor, type: "gap" });
+    }
+    // The worklog arc
+    const isActive = arc.entryIndex === selectedIndex || arc.entryIndex === hoveredIndex;
+    const hasFocus = selectedIndex !== null || hoveredIndex !== null;
+    const ei = arc.entryIndex;
+    data.push({
+      value: arc.endAngle - arc.startAngle,
+      type: "worklog",
+      fill: arc.color,
+      entryIndex: ei,
+      opacity: isActive ? 1 : hasFocus ? 0.3 : 0.9,
+      isActive,
+      onSelect: () => onSelect(ei === selectedIndex ? null : ei),
+      onHover: () => onHover(ei),
+      onUnhover,
+    });
+    cursor = arc.endAngle;
+  }
+
+  // Gap after last arc to complete the circle
+  if (cursor < 359.9) {
+    data.push({ value: 360 - cursor, type: "gap" });
+  }
+
+  return data;
+}
+
 function ClockSVG({ entries, totalSeconds, size = 290, selectedIndex, onSelectEntry }) {
   const CX = size / 2;
   const CY = size / 2;
   const scale = size / 300;
-  const RING_R = 108 * scale;
-  const RING_W = 30 * scale;
+
+  // Ring geometry
+  const RING_OUTER = 123 * scale;
+  const RING_INNER = 93 * scale;
+  const RING_W = RING_OUTER - RING_INNER;
+  const BAND_GAP = 2 * scale;
   const LABEL_R = 136 * scale;
-  const TICK_IN = RING_R - RING_W / 2 - 1 * scale;
-  const TICK_OUT = RING_R + RING_W / 2 + 4 * scale;
-  const HOUR_DOT_R = RING_R + RING_W / 2 + 2 * scale;
-  const BAND_GAP = 1.5 * scale;
+  const TICK_IN = RING_INNER - 1 * scale;
+  const TICK_OUT = RING_OUTER + 4 * scale;
+  const HOUR_DOT_R = RING_OUTER + 2 * scale;
 
   const [hoveredIndex, setHoveredIndex] = useState(null);
 
@@ -291,6 +398,24 @@ function ClockSVG({ entries, totalSeconds, size = 290, selectedIndex, onSelectEn
     [entries, colorMap]
   );
 
+  // Group arcs by lane
+  const lanes = useMemo(() => {
+    const groups = {};
+    for (const arc of arcs) {
+      if (!groups[arc.lane]) groups[arc.lane] = [];
+      groups[arc.lane].push(arc);
+    }
+    const totalLanes = Math.max(1, Object.keys(groups).length);
+    const laneWidth = Math.max(4 * scale, (RING_W - BAND_GAP * (totalLanes - 1)) / totalLanes);
+
+    return Object.entries(groups).map(([lane, laneArcs]) => {
+      const l = Number(lane);
+      const outer = RING_OUTER - l * (laneWidth + BAND_GAP);
+      const inner = outer - laneWidth;
+      return { lane: l, arcs: laneArcs, outer, inner };
+    });
+  }, [arcs, RING_W, RING_OUTER, BAND_GAP, scale]);
+
   const progressPct = Math.min(totalSeconds / TARGET_SECONDS, 1);
   const BAR_W = 72 * scale;
   const BAR_H = 3 * scale;
@@ -302,125 +427,137 @@ function ClockSVG({ entries, totalSeconds, size = 290, selectedIndex, onSelectEn
     (a) => !majorAngles.has(a)
   );
 
+  // Recharts: startAngle=90 (top), endAngle=-270 (full clockwise circle)
+  const CHART_START = 90;
+  const CHART_END = -270;
+
   return (
-    <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} style={{ overflow: "visible" }}>
-      <defs>
-        {/* Glow filter for selected/hovered arcs */}
-        <filter id="arc-glow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation={3 * scale} result="blur" />
-          <feMerge>
-            <feMergeNode in="blur" />
-            <feMergeNode in="SourceGraphic" />
-          </feMerge>
-        </filter>
-      </defs>
+    <div style={{ position: "relative", width: size, height: size }}>
+      {/* Recharts PieChart for arcs */}
+      <PieChart width={size} height={size} style={{ position: "absolute", top: 0, left: 0, outline: "none" }} accessibilityLayer={false}>
+        {/* Background track ring */}
+        <Pie
+          data={[{ value: 1 }]}
+          cx={CX} cy={CY}
+          innerRadius={RING_INNER}
+          outerRadius={RING_OUTER}
+          startAngle={CHART_START}
+          endAngle={CHART_END}
+          fill={T.surface2}
+          stroke="none"
+          isAnimationActive={false}
+          dataKey="value"
+        />
 
-      {/* Track ring */}
-      <circle cx={CX} cy={CY} r={RING_R} fill="none" stroke={T.surface2} strokeWidth={RING_W} />
+        {/* Worklog arcs — one Pie ring per overlap lane */}
+        {lanes.map(({ lane, arcs: laneArcs, outer, inner }) => {
+          const pieData = buildLanePieData(
+            laneArcs, selectedIndex, hoveredIndex,
+            onSelectEntry, setHoveredIndex, () => setHoveredIndex(null)
+          );
 
-      {/* Worklog arcs — one path per entry, lanes offset radially for overlaps */}
-      {arcs.map(({ startAngle, endAngle, color, lane, totalLanes, entryIndex }) => {
-        const laneWidth = (RING_W - BAND_GAP * (totalLanes - 1)) / totalLanes;
-        // Lane 0 = outermost strip
-        const bandCenter = RING_R + RING_W / 2 - lane * (laneWidth + BAND_GAP) - laneWidth / 2;
-        const isSelected = selectedIndex === entryIndex;
-        const isHovered = hoveredIndex === entryIndex;
-        const isActive = isSelected || isHovered;
-        const hasFocus = selectedIndex !== null || hoveredIndex !== null;
-        const opacity = isActive ? 1 : hasFocus ? 0.25 : 0.88;
-        return (
-          <path
-            key={entryIndex}
-            d={arcPath(CX, CY, bandCenter, startAngle, endAngle)}
-            fill="none"
-            stroke={color}
-            strokeWidth={laneWidth}
-            strokeLinecap="round"
-            opacity={opacity}
-            filter={isActive ? "url(#arc-glow)" : undefined}
-            style={{ cursor: "pointer", transition: "opacity 0.18s" }}
-            onClick={() => onSelectEntry(entryIndex === selectedIndex ? null : entryIndex)}
-            onMouseEnter={() => setHoveredIndex(entryIndex)}
-            onMouseLeave={() => setHoveredIndex(null)}
-          />
-        );
-      })}
-
-      {/* Minor hour dots */}
-      {minorDots.map((angle) => {
-        const p = polarXY(CX, CY, HOUR_DOT_R, angle);
-        return <circle key={angle} cx={p.x} cy={p.y} r={1.5 * scale} fill={T.textDim} opacity={0.6} />;
-      })}
-
-      {/* Major hour ticks + labels */}
-      {TICK_LABELS.map(({ label, angleDeg }) => {
-        const inner = polarXY(CX, CY, TICK_IN, angleDeg);
-        const outer = polarXY(CX, CY, TICK_OUT, angleDeg);
-        const lp = polarXY(CX, CY, LABEL_R, angleDeg);
-        return (
-          <g key={label}>
-            <line x1={inner.x} y1={inner.y} x2={outer.x} y2={outer.y} stroke={T.textDim} strokeWidth={1.5 * scale} />
-            <text
-              x={lp.x}
-              y={lp.y}
-              textAnchor="middle"
-              dominantBaseline="middle"
-              fill={T.textMuted}
-              fontSize={8.5 * scale}
-              fontFamily="'DM Mono', monospace"
+          return (
+            <Pie
+              key={lane}
+              data={pieData}
+              cx={CX} cy={CY}
+              innerRadius={inner}
+              outerRadius={outer}
+              startAngle={CHART_START}
+              endAngle={CHART_END}
+              stroke="none"
+              cornerRadius={6}
+              isAnimationActive={false}
+              dataKey="value"
+              activeIndex={-1}
+              shape={<InteractiveSector />}
             >
-              {label}
-            </text>
-          </g>
-        );
-      })}
+              {pieData.map((d, i) => (
+                <Cell
+                  key={i}
+                  fill={d.type === "gap" ? "transparent" : d.fill}
+                />
+              ))}
+            </Pie>
+          );
+        })}
+      </PieChart>
 
-      {/* Center: total logged */}
-      <text
-        x={CX}
-        y={CY - 22 * scale}
-        textAnchor="middle"
-        dominantBaseline="middle"
-        fill={T.text}
-        fontSize={28 * scale}
-        fontWeight={700}
-        fontFamily="'Syne', sans-serif"
-        letterSpacing={-0.5}
+      {/* SVG overlay for ticks, labels, center text */}
+      <svg
+        viewBox={`0 0 ${size} ${size}`}
+        width={size}
+        height={size}
+        style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
       >
-        {fmt(totalSeconds, true)}
-      </text>
+        {/* Minor hour dots */}
+        {minorDots.map((angle) => {
+          const p = polarXY(CX, CY, HOUR_DOT_R, angle);
+          return <circle key={angle} cx={p.x} cy={p.y} r={1.5 * scale} fill={T.textDim} opacity={0.6} />;
+        })}
 
-      {/* Center: subtitle */}
-      <text
-        x={CX}
-        y={CY + 2 * scale}
-        textAnchor="middle"
-        dominantBaseline="middle"
-        fill={T.textMuted}
-        fontSize={9.5 * scale}
-        fontFamily="'DM Mono', monospace"
-        letterSpacing={0.3}
-      >
-        logged today
-      </text>
+        {/* Major hour ticks + labels */}
+        {TICK_LABELS.map(({ label, angleDeg }) => {
+          const inner = polarXY(CX, CY, TICK_IN, angleDeg);
+          const outer = polarXY(CX, CY, TICK_OUT, angleDeg);
+          const lp = polarXY(CX, CY, LABEL_R, angleDeg);
+          return (
+            <g key={label}>
+              <line x1={inner.x} y1={inner.y} x2={outer.x} y2={outer.y} stroke={T.textDim} strokeWidth={1.5 * scale} />
+              <text
+                x={lp.x} y={lp.y}
+                textAnchor="middle" dominantBaseline="middle"
+                fill={T.textMuted}
+                fontSize={8.5 * scale}
+                fontFamily="'DM Mono', monospace"
+              >
+                {label}
+              </text>
+            </g>
+          );
+        })}
 
-      {/* Progress bar */}
-      <rect x={BAR_X} y={BAR_Y} width={BAR_W} height={BAR_H} rx={BAR_H / 2} fill={T.surface2} />
-      <rect x={BAR_X} y={BAR_Y} width={BAR_W * progressPct} height={BAR_H} rx={BAR_H / 2} fill={T.green} />
+        {/* Center: total logged */}
+        <text
+          x={CX} y={CY - 22 * scale}
+          textAnchor="middle" dominantBaseline="middle"
+          fill={T.text}
+          fontSize={28 * scale}
+          fontWeight={700}
+          fontFamily="'Syne', sans-serif"
+          letterSpacing={-0.5}
+        >
+          {fmt(totalSeconds, true)}
+        </text>
 
-      {/* Progress label */}
-      <text
-        x={CX}
-        y={BAR_Y + 13 * scale}
-        textAnchor="middle"
-        dominantBaseline="middle"
-        fill={T.textDim}
-        fontSize={8.5 * scale}
-        fontFamily="'DM Mono', monospace"
-      >
-        {Math.round(progressPct * 100)}% · target {fmt(TARGET_SECONDS, true)}
-      </text>
-    </svg>
+        {/* Center: subtitle */}
+        <text
+          x={CX} y={CY + 2 * scale}
+          textAnchor="middle" dominantBaseline="middle"
+          fill={T.textMuted}
+          fontSize={9.5 * scale}
+          fontFamily="'DM Mono', monospace"
+          letterSpacing={0.3}
+        >
+          logged today
+        </text>
+
+        {/* Progress bar */}
+        <rect x={BAR_X} y={BAR_Y} width={BAR_W} height={BAR_H} rx={BAR_H / 2} fill={T.surface2} />
+        <rect x={BAR_X} y={BAR_Y} width={BAR_W * progressPct} height={BAR_H} rx={BAR_H / 2} fill={T.green} />
+
+        {/* Progress label */}
+        <text
+          x={CX} y={BAR_Y + 13 * scale}
+          textAnchor="middle" dominantBaseline="middle"
+          fill={T.textDim}
+          fontSize={8.5 * scale}
+          fontFamily="'DM Mono', monospace"
+        >
+          {Math.round(progressPct * 100)}% · target {fmt(TARGET_SECONDS, true)}
+        </text>
+      </svg>
+    </div>
   );
 }
 
