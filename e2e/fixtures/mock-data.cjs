@@ -59,9 +59,30 @@ const FAKE_WORKLOGS = {
   ],
 };
 
+const FAKE_UNLOGGED = {
+  issues: [
+    {
+      key: "PROJ-200",
+      summary: "Set up CI pipeline for staging",
+      status: "To Do",
+      issueType: "Task",
+      project: "PROJ",
+      updated: "2026-04-05T10:00:00.000+0000",
+    },
+    {
+      key: "PROJ-201",
+      summary: "Update README documentation",
+      status: "In Progress",
+      issueType: "Story",
+      project: "PROJ",
+      updated: "2026-04-09T15:30:00.000+0000",
+    },
+  ],
+};
+
 const FAKE_MYSELF_RESPONSE = {
   accountId: FAKE_CREDS.accountId,
   displayName: FAKE_CREDS.displayName,
 };
 
-module.exports = { FAKE_CREDS, FAKE_WORKLOGS, FAKE_MYSELF_RESPONSE };
+module.exports = { FAKE_CREDS, FAKE_WORKLOGS, FAKE_UNLOGGED, FAKE_MYSELF_RESPONSE };

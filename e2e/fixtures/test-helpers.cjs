@@ -1,4 +1,4 @@
-const { FAKE_CREDS, FAKE_WORKLOGS, FAKE_MYSELF_RESPONSE } = require("./mock-data.cjs");
+const { FAKE_CREDS, FAKE_WORKLOGS, FAKE_UNLOGGED, FAKE_MYSELF_RESPONSE } = require("./mock-data.cjs");
 
 async function injectCredentials(page, creds = FAKE_CREDS) {
   await page.addInitScript((credsArg) => {
@@ -10,7 +10,7 @@ async function injectCredentials(page, creds = FAKE_CREDS) {
   }, creds);
 }
 
-async function mockJiraAPIs(page, worklogs = FAKE_WORKLOGS) {
+async function mockJiraAPIs(page, worklogs = FAKE_WORKLOGS, unlogged = FAKE_UNLOGGED) {
   await page.route("**/api/jira/myself", async (route) => {
     await route.fulfill({
       status: 200,
@@ -24,6 +24,14 @@ async function mockJiraAPIs(page, worklogs = FAKE_WORKLOGS) {
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(worklogs),
+    });
+  });
+
+  await page.route("**/api/jira/unlogged", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(unlogged),
     });
   });
 }

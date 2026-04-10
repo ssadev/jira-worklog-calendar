@@ -60,7 +60,7 @@ test.describe("Calendar View", () => {
     await expect(page.locator("text=MONTH TOTAL")).toBeVisible();
     await expect(page.locator("text=DAYS LOGGED")).toBeVisible();
     await expect(page.locator("text=AVG / DAY")).toBeVisible();
-    await expect(page.locator("text=TICKETS")).toBeVisible();
+    await expect(page.getByText("TICKETS", { exact: true })).toBeVisible();
   });
 
   test("heat legend is visible", async ({ page }) => {

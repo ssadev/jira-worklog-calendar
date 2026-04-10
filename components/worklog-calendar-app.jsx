@@ -223,6 +223,9 @@ function makeClient(domain, email, token) {
     async fetchMonthWorklogs(accountId, year, month) {
       return callLocalApi("/api/jira/worklogs", { ...creds, accountId, year, month });
     },
+    async fetchUnloggedTickets(accountId, year, month) {
+      return callLocalApi("/api/jira/unlogged", { ...creds, accountId, year, month });
+    },
   };
 }
 
@@ -561,6 +564,9 @@ function Calendar({ creds, onLogout }) {
   const [fetched, setFetched] = useState(() => new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [unlogged, setUnlogged] = useState({});
+  const [unloggedLoading, setUnloggedLoading] = useState(false);
+  const [unloggedOpen, setUnloggedOpen] = useState(false);
 
   const year = cur.getFullYear();
   const month = cur.getMonth();
@@ -613,9 +619,15 @@ function Calendar({ creds, onLogout }) {
 
       setLoading(true);
       setError(null);
+      setUnloggedLoading(true);
 
-      try {
-        const byDate = await clientRef.current.fetchMonthWorklogs(creds.accountId, targetYear, targetMonth);
+      const [worklogResult, unloggedResult] = await Promise.allSettled([
+        clientRef.current.fetchMonthWorklogs(creds.accountId, targetYear, targetMonth),
+        clientRef.current.fetchUnloggedTickets(creds.accountId, targetYear, targetMonth),
+      ]);
+
+      if (worklogResult.status === "fulfilled") {
+        const byDate = worklogResult.value;
         setData((prev) => {
           const next = { ...prev };
           const prefix = `${key}-`;
@@ -628,17 +640,22 @@ function Calendar({ creds, onLogout }) {
 
           return { ...next, ...byDate };
         });
-
-        setFetched((prev) => {
-          const next = new Set(prev);
-          next.add(key);
-          return next;
-        });
-      } catch (requestError) {
-        setError(requestError.message);
-      } finally {
-        setLoading(false);
+      } else {
+        setError(worklogResult.reason?.message || "Failed to load worklogs.");
       }
+
+      if (unloggedResult.status === "fulfilled") {
+        setUnlogged((prev) => ({ ...prev, [key]: unloggedResult.value.issues || [] }));
+      }
+
+      setFetched((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+
+      setLoading(false);
+      setUnloggedLoading(false);
     },
     [creds.accountId, fetched],
   );
@@ -664,6 +681,8 @@ function Calendar({ creds, onLogout }) {
   const selectedTotal = selectedEntries.reduce((sum, entry) => sum + entry.timeSpentSeconds, 0);
   const selectedTicketCount = new Set(selectedEntries.map(e => e.issueKey)).size;
   const hasFetched = fetched.has(activeMonthKey);
+  const activeUnlogged = unlogged[activeMonthKey] || [];
+  const unloggedCount = activeUnlogged.length;
   const allMonths = [...new Set(Object.keys(data).map((date) => date.slice(0, 7)))].sort();
 
   return (
@@ -963,60 +982,6 @@ function Calendar({ creds, onLogout }) {
                 );
               })}
             </div>
-
-            <div
-              style={{
-                marginTop: 14,
-                padding: "13px 16px",
-                background: T.surface,
-                border: `1px solid ${T.border}`,
-                borderRadius: 7,
-                display: "flex",
-                alignItems: "center",
-                flexWrap: "wrap",
-                gap: 16,
-              }}
-            >
-              {[
-                { label: "MONTH TOTAL", value: fmt(monthTotal, true), color: monthTotal > 0 ? T.accent : T.textDim },
-                { label: "DAYS LOGGED", value: daysLogged || "—", color: daysLogged > 0 ? T.accentBr : T.textDim },
-                {
-                  label: "AVG / DAY",
-                  value: daysLogged > 0 ? fmt(Math.round(monthTotal / daysLogged), true) : "—",
-                  color: daysLogged > 0 ? T.text : T.textDim,
-                },
-                { label: "TICKETS", value: ticketCount || "—", color: ticketCount > 0 ? T.green : T.textDim },
-              ].map(({ label, value, color }, index) => (
-                <div
-                  key={label}
-                  style={{
-                    flex: "1 1 140px",
-                    paddingRight: 16,
-                    borderRight: index < 3 ? `1px solid ${T.border}` : "none",
-                    marginRight: index < 3 ? 16 : 0,
-                  }}
-                >
-                  <div style={{ fontSize: 9, color: T.textMuted, letterSpacing: "0.12em", marginBottom: 3 }}>{label}</div>
-                  <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 20, fontWeight: 700, color }}>{value}</div>
-                </div>
-              ))}
-
-              <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
-                {[0, 1, 2, 3, 4, 5].map((value) => (
-                  <div
-                    key={value}
-                    style={{
-                      width: 12,
-                      height: 12,
-                      borderRadius: 2,
-                      background: value === 0 ? T.surface2 : HEAT_STYLE[value].bar,
-                      border: `1px solid ${value === 0 ? T.border : "transparent"}`,
-                    }}
-                  />
-                ))}
-                <span style={{ fontSize: 9, color: T.textMuted, marginLeft: 4 }}>less → more</span>
-              </div>
-            </div>
           </div>
 
           <div
@@ -1105,6 +1070,153 @@ function Calendar({ creds, onLogout }) {
             )}
           </div>
         </div>
+
+        <div
+          style={{
+            marginTop: 14,
+            padding: "13px 16px",
+            background: T.surface,
+            border: `1px solid ${T.border}`,
+            borderRadius: 7,
+            display: "flex",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 16,
+          }}
+        >
+          {[
+            { label: "MONTH TOTAL", value: fmt(monthTotal, true), color: monthTotal > 0 ? T.accent : T.textDim },
+            { label: "DAYS LOGGED", value: daysLogged || "—", color: daysLogged > 0 ? T.accentBr : T.textDim },
+            {
+              label: "AVG / DAY",
+              value: daysLogged > 0 ? fmt(Math.round(monthTotal / daysLogged), true) : "—",
+              color: daysLogged > 0 ? T.text : T.textDim,
+            },
+            { label: "TICKETS", value: ticketCount || "—", color: ticketCount > 0 ? T.green : T.textDim },
+            { label: "UNLOGGED", value: unloggedLoading ? "…" : (unloggedCount || "—"), color: unloggedCount > 0 ? T.red : T.textDim },
+          ].map(({ label, value, color }, index, arr) => (
+            <div
+              key={label}
+              style={{
+                flex: "1 1 120px",
+                paddingRight: 16,
+                borderRight: index < arr.length - 1 ? `1px solid ${T.border}` : "none",
+                marginRight: index < arr.length - 1 ? 16 : 0,
+              }}
+            >
+              <div style={{ fontSize: 9, color: T.textMuted, letterSpacing: "0.12em", marginBottom: 3 }}>{label}</div>
+              <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 20, fontWeight: 700, color }}>{value}</div>
+            </div>
+          ))}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
+            {[0, 1, 2, 3, 4, 5].map((value) => (
+              <div
+                key={value}
+                style={{
+                  width: 12,
+                  height: 12,
+                  borderRadius: 2,
+                  background: value === 0 ? T.surface2 : HEAT_STYLE[value].bar,
+                  border: `1px solid ${value === 0 ? T.border : "transparent"}`,
+                }}
+              />
+            ))}
+            <span style={{ fontSize: 9, color: T.textMuted, marginLeft: 4 }}>less → more</span>
+          </div>
+        </div>
+
+        {unloggedCount > 0 && (
+          <div
+            style={{
+              marginTop: 12,
+              border: `1px solid ${T.border}`,
+              borderRadius: 7,
+              overflow: "hidden",
+            }}
+          >
+            <button
+              onClick={() => setUnloggedOpen((o) => !o)}
+              style={{
+                width: "100%",
+                padding: "11px 16px",
+                background: T.surface,
+                border: "none",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                cursor: "pointer",
+                color: T.text,
+                fontFamily: "inherit",
+                fontSize: "inherit",
+              }}
+            >
+              <span style={{ fontSize: 9, letterSpacing: "0.12em", color: T.textMuted }}>
+                UNLOGGED TICKETS
+              </span>
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: T.red,
+                  background: "rgba(248,113,113,.12)",
+                  padding: "2px 8px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(248,113,113,.25)",
+                }}
+              >
+                {unloggedCount}
+              </span>
+              <span style={{ marginLeft: "auto", fontSize: 12, color: T.textMuted }}>
+                {unloggedOpen ? "−" : "+"}
+              </span>
+            </button>
+
+            {unloggedOpen && (
+              <div
+                style={{
+                  padding: "8px 11px 11px",
+                  maxHeight: 320,
+                  overflowY: "auto",
+                  borderTop: `1px solid ${T.border}`,
+                }}
+              >
+                {activeUnlogged.map((issue) => (
+                  <div key={issue.key} className="ir">
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                      <a
+                        href={`https://${creds.domain}.atlassian.net/browse/${issue.key}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="pill"
+                        style={{ textDecoration: "none", color: "inherit" }}
+                      >
+                        {issue.key}
+                      </a>
+                      <span
+                        style={{
+                          fontSize: 9,
+                          color: T.textMuted,
+                          padding: "2px 6px",
+                          border: `1px solid ${T.border}`,
+                          borderRadius: 3,
+                        }}
+                      >
+                        {issue.status}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: T.textSub, marginTop: 6, lineHeight: 1.5 }}>
+                      {issue.summary}
+                    </div>
+                    <div style={{ fontSize: 9, color: T.textDim, marginTop: 4 }}>
+                      {issue.issueType} · {issue.project} · updated {new Date(issue.updated).toLocaleDateString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
