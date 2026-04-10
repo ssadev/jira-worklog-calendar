@@ -1,0 +1,10 @@
+{
+  "people": [
+    "User"
+  ],
+  "projects": [
+    "Jira",
+    "Calendar",
+    "Worklog"
+  ]
+}

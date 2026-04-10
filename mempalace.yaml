@@ -1,0 +1,65 @@
+wing: jira_worklog_calender
+rooms:
+- name: app
+  description: Files from app/
+  keywords:
+  - app
+  - app
+- name: testing
+  description: Files from test/
+  keywords:
+  - testing
+  - test
+- name: shared
+  description: Files from shared/
+  keywords:
+  - shared
+  - shared
+- name: frontend
+  description: Files from components/
+  keywords:
+  - frontend
+  - components
+- name: public
+  description: Files from public/
+  keywords:
+  - public
+  - public
+- name: lib
+  description: Files from lib/
+  keywords:
+  - lib
+  - lib
+- name: playwright_report
+  description: Files from playwright-report/
+  keywords:
+  - playwright_report
+  - playwright-report
+- name: test_results
+  description: Files from test-results/
+  keywords:
+  - test_results
+  - test-results
+- name: e2e
+  description: Files from e2e/
+  keywords:
+  - e2e
+  - e2e
+- name: src
+  description: Files from src/
+  keywords:
+  - src
+  - src
+- name: backend
+  description: Files from api/
+  keywords:
+  - backend
+  - api
+- name: design
+  description: Files from assets/
+  keywords:
+  - design
+  - assets
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []
