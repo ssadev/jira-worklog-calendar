@@ -18,6 +18,10 @@ test.describe("Daily Worklog Page", () => {
 
     // Clock SVG should render (Recharts PieChart)
     await expect(page.locator(".recharts-wrapper")).toBeVisible();
+    await expect(page.getByText("10am", { exact: true })).toBeVisible();
+    await expect(page.getByText("1pm", { exact: true })).toBeVisible();
+    await expect(page.getByText("4pm", { exact: true })).toBeVisible();
+    await expect(page.getByText("7pm", { exact: true })).toBeVisible();
 
     // Worklog entries
     await expect(page.locator("text=PROJ-101")).toBeVisible();

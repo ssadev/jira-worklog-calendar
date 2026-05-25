@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PieChart, Pie, Cell, Sector } from "recharts";
 
@@ -36,28 +36,29 @@ const PALETTE = [
 ];
 
 // ─── Clock config ────────────────────────────────────────────────────────────
-const CLOCK_START_HOUR = 9;   // 9 am
-const CLOCK_TOTAL_HOURS = 12; // 9 am → 9 pm
+const CLOCK_START_HOUR = 10;  // 10 am
+const CLOCK_TOTAL_HOURS = 12; // 10 am → 10 pm
 const TARGET_SECONDS = 8 * 3600;
 
 const TICK_LABELS = [
-  { label: "9am", angleDeg: 0 },
-  { label: "12", angleDeg: 90 },
-  { label: "3pm", angleDeg: 180 },
-  { label: "6pm", angleDeg: 270 },
+  { label: "10am", angleDeg: 0 },
+  { label: "1pm", angleDeg: 90 },
+  { label: "4pm", angleDeg: 180 },
+  { label: "7pm", angleDeg: 270 },
 ];
 
 // ─── Responsive hook ──────────────────────────────────────────────────────────
 function useIsDesktop(breakpoint = 768) {
-  const [isDesktop, setIsDesktop] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia(`(min-width: ${breakpoint}px)`);
-    setIsDesktop(mq.matches);
-    const handler = (e) => setIsDesktop(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, [breakpoint]);
-  return isDesktop;
+  const query = `(min-width: ${breakpoint}px)`;
+  return useSyncExternalStore(
+    (callback) => {
+      const mq = window.matchMedia(query);
+      mq.addEventListener("change", callback);
+      return () => mq.removeEventListener("change", callback);
+    },
+    () => window.matchMedia(query).matches,
+    () => false
+  );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -141,47 +142,43 @@ function polarXY(cx, cy, r, angleDeg) {
   return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
 }
 
-function arcPath(cx, cy, r, startDeg, endDeg) {
-  const span = endDeg - startDeg;
-  // For near-full-circle arcs, draw two half-arcs to avoid SVG arc ambiguity
-  if (span >= 359.99) {
-    const mid = startDeg + 180;
-    const s = polarXY(cx, cy, r, startDeg);
-    const m = polarXY(cx, cy, r, mid);
-    return `M ${s.x} ${s.y} A ${r} ${r} 0 1 1 ${m.x} ${m.y} A ${r} ${r} 0 1 1 ${s.x} ${s.y}`;
-  }
-  const s = polarXY(cx, cy, r, startDeg);
-  const e = polarXY(cx, cy, r, endDeg);
-  const large = span > 180 ? 1 : 0;
-  return `M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`;
+function secondsIntoDay(date) {
+  return date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
 }
 
-// Convert a worklog's startedAt ISO string → angle on the clock face
-function startedToAngle(startedAt) {
-  if (!startedAt) return null;
+// Convert a worklog's local start/end time into clipped clock angles.
+function worklogToClockAngles(startedAt, timeSpentSeconds) {
+  if (!startedAt || !timeSpentSeconds) return null;
   const d = new Date(startedAt);
   if (isNaN(d)) return null;
-  const hours = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
-  const offset = hours - CLOCK_START_HOUR;
-  const clamped = Math.max(0, Math.min(CLOCK_TOTAL_HOURS, offset));
-  return (clamped / CLOCK_TOTAL_HOURS) * 360;
-}
 
-function secondsToAngle(seconds) {
-  return (seconds / (CLOCK_TOTAL_HOURS * 3600)) * 360;
+  const visibleStart = CLOCK_START_HOUR * 3600;
+  const visibleEnd = visibleStart + CLOCK_TOTAL_HOURS * 3600;
+  const start = secondsIntoDay(d);
+  const end = start + timeSpentSeconds;
+  const clippedStart = Math.max(start, visibleStart);
+  const clippedEnd = Math.min(end, visibleEnd);
+
+  if (clippedEnd <= clippedStart) return null;
+
+  const totalVisibleSeconds = CLOCK_TOTAL_HOURS * 3600;
+  return {
+    startAngle: ((clippedStart - visibleStart) / totalVisibleSeconds) * 360,
+    endAngle: ((clippedEnd - visibleStart) / totalVisibleSeconds) * 360,
+  };
 }
 
 // ─── Gap detection ────────────────────────────────────────────────────────────
 function findGaps(entries) {
   const WORK_START = CLOCK_START_HOUR * 3600;
-  const WORK_END = (CLOCK_START_HOUR + 9) * 3600; // 9am to 6pm
+  const WORK_END = (CLOCK_START_HOUR + 9) * 3600; // 10am to 7pm
 
   const intervals = entries
     .map((e) => {
       if (!e.startedAt) return null;
       const d = new Date(e.startedAt);
       if (isNaN(d)) return null;
-      const start = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+      const start = secondsIntoDay(d);
       const end = start + e.timeSpentSeconds;
       return { start: Math.max(start, WORK_START), end: Math.min(end, WORK_END) };
     })
@@ -242,9 +239,10 @@ const MIN_ARC_ANGLE = 3; // Minimum arc span in degrees so short worklogs stay v
 function buildClockArcs(entries, colorMap) {
   const arcs = entries
     .map((e, entryIndex) => {
-      const startAngle = startedToAngle(e.startedAt);
-      if (startAngle === null) return null;
-      const spanAngle = secondsToAngle(e.timeSpentSeconds);
+      const clockAngles = worklogToClockAngles(e.startedAt, e.timeSpentSeconds);
+      if (!clockAngles) return null;
+      const { startAngle, endAngle: rawEndAngle } = clockAngles;
+      const spanAngle = rawEndAngle - startAngle;
       // Enforce minimum visible arc span
       const effectiveSpan = Math.max(spanAngle, MIN_ARC_ANGLE);
       const endAngle = Math.min(startAngle + effectiveSpan, 360);
@@ -315,14 +313,6 @@ function InteractiveSector(props) {
       onMouseLeave={() => { if (payload.onUnhover) payload.onUnhover(); }}
     />
   );
-}
-
-// Convert our clock angles (0°=9am, clockwise) to Recharts angles (90°=top, counter-clockwise)
-// Our 0° (9am) = top of clock = Recharts 90°
-// Our angle increases clockwise, Recharts increases counter-clockwise
-// So: rechartsAngle = 90 - ourAngle
-function toRechartsAngle(ourAngle) {
-  return 90 - ourAngle;
 }
 
 // Build pie data for a single lane — fill gaps with transparent entries
